@@ -110,14 +110,16 @@ class FeedForward(Module):
         return self.net(x)
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_scales, heads=8, dim_head=64, dropout=0.):
+
+class MultiScaleJointAttention(nn.Module):
+    def __init__(self, dim, num_scales, context_dim=4096, heads=8, dim_head=64, dropout=0.):
         super().__init__()
         self.num_scales = num_scales
         self.heads = heads
         self.scale = dim_head ** -0.5
         inner_dim = dim_head * heads
 
+   
         self.to_qkv = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(dim, 3 * inner_dim, bias=False),
@@ -125,39 +127,61 @@ class Attention(nn.Module):
             )
             for _ in range(num_scales)
         ])
-
-        self.to_out = nn.ModuleList([
+        self.to_out_vid = nn.ModuleList([
             nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
             for _ in range(num_scales)
         ])
 
+       
+        self.to_qkv_txt = nn.Sequential(
+            nn.Linear(context_dim, 3 * inner_dim, bias=False),
+            Rearrange('b n (qkv h d) -> qkv b h n d', qkv=3, h=self.heads)
+        )
+        self.to_out_txt = nn.Sequential(nn.Linear(inner_dim, context_dim), nn.Dropout(dropout))
+
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, xs):
-
+    def forward(self, xs, context):
         device = xs[0].device
+        text_len = context.shape[1]
+        lens = [x.shape[1] for x in xs] # Lengths of Coarse, Medium, Fine, etc.
 
-        lens = [x.shape[1] for x in xs]
+        # Project text
+        qkv_txt = self.to_qkv_txt(context)
+        q_txt, k_txt, v_txt = qkv_txt[0], qkv_txt[1], qkv_txt[2]
 
+        # Project video 
         qkvs = [qkv_layer(x) for qkv_layer, x in zip(self.to_qkv, xs)]
-
         qs, ks, vs = zip(*qkvs)
+        
+        # concat video scales 
+        q_vid = torch.cat(qs, dim=2)
+        k_vid = torch.cat(ks, dim=2)
+        v_vid = torch.cat(vs, dim=2)
 
-        q = torch.cat(qs, dim=2)
-        k = torch.cat(ks, dim=2)
-        v = torch.cat(vs, dim=2)
+        # concat for joint attention
+        q = torch.cat([q_txt, q_vid], dim=2)
+        k = torch.cat([k_txt, k_vid], dim=2)
+        v = torch.cat([v_txt, v_vid], dim=2)
 
+        # build the mask
         scale_indices = torch.arange(self.num_scales, device=device)
-        lens_t = torch.tensor(lens, device=device)
+        lens_t_tensor = torch.tensor(lens, device=device)
 
-        token_scales = torch.repeat_interleave(scale_indices, lens_t)
+        token_scales = torch.repeat_interleave(scale_indices, lens_t_tensor)
         q_scales = rearrange(token_scales, 'q -> q 1')
         k_scales = rearrange(token_scales, 'k -> 1 k')
 
-        causal_mask = k_scales > q_scales
+        video_causal_mask = k_scales > q_scales 
+        
+        total_len = text_len + sum(lens)
+        joint_mask = torch.zeros((total_len, total_len), dtype=torch.bool, device=device)
+        
+        joint_mask[text_len:, text_len:] = video_causal_mask
 
+        # global attention
         sim = torch.einsum('b h q d, b h k d -> b h q k', q, k) * self.scale
-        sim.masked_fill_(causal_mask, -torch.finfo(sim.dtype).max)
+        sim.masked_fill_(joint_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim=-1)
         attn = self.dropout(attn)
@@ -165,45 +189,56 @@ class Attention(nn.Module):
         out_global = torch.einsum('b h q k, b h k d -> b h q d', attn, v)
         out_global = rearrange(out_global, 'b h n d -> b n (h d)')
 
-        outs = torch.split(out_global, lens, dim=1)
+        out_txt = out_global[:, :text_len, :]
+        txt_out = self.to_out_txt(out_txt)
 
-        outs = [self.to_out[i](outs[i]) for i in range(self.num_scales)]
+        out_vid = out_global[:, text_len:, :]
+        outs_vid = torch.split(out_vid, lens, dim=1)
+        
+        vid_outs = [self.to_out_vid[i](outs_vid[i]) for i in range(self.num_scales)]
 
-        return outs
+        return vid_outs, txt_out
+
 
 
 class DiTBlock(Module):
-    def __init__(self, dim, num_scales, heads, dim_head, mlp_dim, dropout = 0.):
+    def __init__(self, dim, num_scales, heads, dim_head, mlp_dim, context_dim=4096, dropout=0.):
         super().__init__()
         self.num_scales = num_scales
 
-        self.norm1 = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(num_scales)])
-        self.norm2 = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(num_scales)])
-        self.ff = nn.ModuleList([FeedForward(dim, mlp_dim, dropout) for _ in range(num_scales)])
-        self.adaln = nn.ModuleList([AdaLNModulation(dim, out_multiplier=6) for _ in range(num_scales)])
+        self.norm1_vid = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(num_scales)])
+        self.norm2_vid = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(num_scales)])
+        self.ff_vid = nn.ModuleList([FeedForward(dim, mlp_dim, dropout) for _ in range(num_scales)])
+        self.adaln_vid = nn.ModuleList([AdaLNModulation(dim, out_multiplier=6) for _ in range(num_scales)])
+    
+        self.norm1_txt = nn.LayerNorm(context_dim)
+        self.norm2_txt = nn.LayerNorm(context_dim)
+        self.ff_txt = FeedForward(context_dim, context_dim * 4, dropout) 
 
-        self.attn = Attention(dim, num_scales, heads, dim_head, dropout)
 
-    def forward(self, xs, c):
-        chunks = [adaln(c).chunk(6, dim=-1) for adaln in self.adaln]
+        self.joint_attn = MultiScaleJointAttention(dim, num_scales, context_dim, heads, dim_head, dropout)
 
-        msa_inputs = [modulate(norm(x), ch[0], ch[1]) for x, norm, ch in zip(xs, self.norm1, chunks)]
+    def forward(self, xs, c, context):
+ 
+        chunks = [adaln(c).chunk(6, dim=-1) for adaln in self.adaln_vid]
 
-        # global attention across scales
-        attn_outs = self.attn(msa_inputs)
+        msa_inputs = [modulate(norm(x), ch[0], ch[1]) for x, norm, ch in zip(xs, self.norm1_vid, chunks)]
+
+  
+        attn_outs, context_outs = self.joint_attn(msa_inputs, self.norm1_txt(context))
+
+        context = context + context_outs
+        context = context + self.ff_txt(self.norm2_txt(context))
 
         outs = []
-        for x, attn_out, norm2, ff, (_, _, gate_msa, shift_mlp, scale_mlp, gate_mlp) in zip(
-            xs, attn_outs, self.norm2, self.ff, chunks
+        for x, attn_out, norm2_vid, ff_vid, (_, _, gate_msa, shift_mlp, scale_mlp, gate_mlp) in zip(
+            xs, attn_outs, self.norm2_vid, self.ff_vid, chunks
         ):
-
             x = x + gate_msa.unsqueeze(1) * attn_out
-
-            x = x + gate_mlp.unsqueeze(1) * ff(modulate(norm2(x), shift_mlp, scale_mlp))
-
+            x = x + gate_mlp.unsqueeze(1) * ff_vid(modulate(norm2_vid(x), shift_mlp, scale_mlp))
             outs.append(x)
 
-        return outs
+        return outs, context
 
 
 class SinusoidalPosEmb(Module):
@@ -291,34 +326,22 @@ class LapFlowDiT(Module):
         self.dropout = nn.Dropout(dropout)
         self.t_embedder = TimestepEmbedder(dim)
 
-        self.cond_mlp = None
-        if accept_cond:
-            if cond_as_labels:
-                assert exists(num_classes), f'`num_classes` must be set when `cond_as_labels` is True'
-                self.cond_mlp = nn.Sequential(
-                    LabelEmbedder(num_classes, dim),
-                    nn.Linear(dim, dim),
-                    nn.GELU(),
-                    nn.Linear(dim, dim)
-                )
-            else:
-                assert exists(dim_cond), f'`dim_cond` must be set on init'
-                first_dim = dim if dim_cond == 1 else dim_cond
-
-                self.cond_mlp = nn.Sequential(
-                    SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta) if dim_cond == 1 else nn.Identity(),
-                    nn.Linear(first_dim, dim),
-                    nn.GELU(),
-                    nn.Linear(dim, dim)
-                )
+        context_dim = dim_cond if dim_cond is not None else dim
 
         self.blocks = nn.ModuleList([
-            DiTBlock(dim, num_scales, heads, dim_head, mlp_dim, dropout)
+            DiTBlock(
+                dim=dim,
+                num_scales=num_scales,
+                heads=heads,
+                dim_head=dim_head,
+                mlp_dim=mlp_dim,
+                context_dim=context_dim,
+                dropout=dropout
+            )
             for _ in range(depth)
         ])
 
     def forward(self, imgs_list, times, cond=None):
-
         xs = []
         for img, patch_embed, pos_embed in zip(imgs_list, self.patch_embeds, self.pos_embeds):
             x = patch_embed(img)
@@ -328,25 +351,24 @@ class LapFlowDiT(Module):
 
         assert exists(times), "Time embedding 't' or 'times' must be provided to LapFlowDiT"
         c = self.t_embedder(times)
-        if exists(self.cond_mlp) and exists(cond):
-            c = c + self.cond_mlp(cond)
+
+        context = cond 
+        if context is not None and context.ndim == 2:
+            context = context.unsqueeze(1)
 
         for block in self.blocks:
-            xs = block(xs, c)
+            xs, context = block(xs, c, context)
 
         outs = []
         for x, adaln, norm, linear, unpatch in zip(
             xs, self.final_adalns, self.final_norms, self.final_linears, self.unpatchifys
         ):
-
             shift, scale = adaln(c).chunk(2, dim=-1)
-
             x = modulate(norm(x), shift, scale)
-
             x = linear(x)
-
             outs.append(unpatch(x))
 
+        return outs
         return outs
 
 
