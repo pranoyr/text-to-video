@@ -180,7 +180,7 @@ class MultiScaleJointAttention(nn.Module):
         v = torch.cat([v_txt, v_vid], dim=2)
 
         # build the mask
-        scale_indices = torch.arange(self.num_scales, device=device)
+        scale_indices = torch.arange(len(xs), device=device)
         lens_t_tensor = torch.tensor(lens, device=device)
 
         token_scales = torch.repeat_interleave(scale_indices, lens_t_tensor)
@@ -209,7 +209,7 @@ class MultiScaleJointAttention(nn.Module):
         out_vid = out_global[:, text_len:, :]
         outs_vid = torch.split(out_vid, lens, dim=1)
         
-        vid_outs = [self.to_out_vid[i](outs_vid[i]) for i in range(self.num_scales)]
+        vid_outs = [self.to_out_vid[i](outs_vid[i]) for i in range(len(xs))]
 
         return vid_outs, txt_out
 
@@ -441,8 +441,6 @@ class LapFlow(Module):
         t_ends = time_points[1:]
         durations = t_ends - t_starts
 
-        is_active_matrix = torch.tril(torch.ones([self.num_scales] * 2, dtype=torch.bool, device=device))
-
         steps = torch.clamp((steps * durations).int(), min=1)
 
         pyd_states = [
@@ -453,35 +451,29 @@ class LapFlow(Module):
         for i in range(self.num_scales):
             t_start = t_starts[i]
             t_end = t_ends[i]
-
-            is_active = is_active_matrix[i]
             step_count = steps[i]
-
             dt = (t_end - t_start) / step_count
 
             times = torch.linspace(t_start, t_end, step_count + 1, device=device)
+            
+            # 1 for coarse, 2 for mid, 3 for fine
+            active_count = i + 1 
 
             for time in times[:-1]:
-                time = time.item()
-                sigma_t = 1 - time
+                time_val = time.item()
+                time_tensor = repeat(torch.tensor([time_val], device=device), '1 -> b', b=batch_size)
+ 
+                time_kwarg = {self.times_cond_kwarg: time_tensor} if exists(self.times_cond_kwarg) else dict()
 
-                time = repeat(torch.tensor([time], device=device), '1 -> b', b=batch_size)
-
-                model_inputs = [
-                    state if active else (noise * sigma_t)
-                    for state, noise, active in zip(pyd_states, noise_pyramid, is_active)
-                ]
-
-                time_kwarg = {self.times_cond_kwarg: time} if exists(self.times_cond_kwarg) else dict()
+                # only pass the active states to the model
+                model_inputs = pyd_states[:active_count]
 
                 if 'cond' in kwargs and self.cfg_scale > 1.0:
                     cond = kwargs['cond']
                     preds_cond = self.model(model_inputs, **time_kwarg, **kwargs)
 
                     kwargs['cond'] = torch.full_like(cond, -1)
-
                     preds_uncond = self.model(model_inputs, **time_kwarg, **kwargs)
-
                     kwargs['cond'] = cond
 
                     preds = [
@@ -491,10 +483,8 @@ class LapFlow(Module):
                 else:
                     preds = self.model(model_inputs, **time_kwarg, **kwargs)
 
-                pyd_states = [
-                    (state + pred * dt) if active else state
-                    for state, pred, active in zip(pyd_states, preds, is_active)
-                ]
+                for j, pred in enumerate(preds):
+                    pyd_states[j] = pyd_states[j] + pred * dt
 
         curr = pyd_states[0]
         for i in range(1, self.num_scales):
@@ -559,12 +549,11 @@ class LapFlow(Module):
 
         time_kwarg = {self.times_cond_kwarg: times} if exists(self.times_cond_kwarg) else dict()
 
-        preds_list = self.model(noised_list, **time_kwarg, **kwargs)
+        preds_list = self.model(noised_list[:active_scale + 1], **time_kwarg, **kwargs)
 
         total_loss = 0.0
 
-        s = active_scale + 1
-        for pred, target, weight in zip(preds_list[:s], target_velocities[:s], self.loss_weights[:s]):
+        for pred, target, weight in zip(preds_list, target_velocities, self.loss_weights):
             total_loss += F.mse_loss(pred, target) * weight
 
         return total_loss
