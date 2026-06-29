@@ -8,20 +8,50 @@ from lapflow import LapFlow, LapFlowDiT
 from rectified_flow import Trainer
 
 
-class DummyVideoDataset(Dataset):
+from datasets import load_dataset
+
+ds = load_dataset("Max-Ploter/detection-moving-mnist-easy")
+
+
+import torch.nn.functional as F
+
+class MovingMNISTDataset(Dataset):
     def __init__(self, image_size, frames=17, cond_dim=512):
         self.image_size = image_size
         self.frames = frames
         self.cond_dim = cond_dim
+        self.dataset = ds["train"]
 
     def __len__(self):
-        return 100
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        # Return dummy video (C, T, H, W) and text embedding
-        video = torch.rand(3, self.frames, self.image_size, self.image_size)
-        text_embed = torch.randn(self.cond_dim)
+        item = self.dataset[idx]
+        # video is a list of frames, each frame is a 2D list of shape (128, 128)
+        video_val = item["video"][:self.frames]
+        
+        # Convert list of lists of lists to a PyTorch tensor (T, H, W) in [0., 1.] range
+        video_tensor = torch.tensor(video_val, dtype=torch.float32) / 255.0
+        
+        # Add channel dimension to get (T, 1, H, W) and repeat to get 3 channels: (T, 3, H, W)
+        video_tensor = video_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
+        
+        # Resize to (self.image_size, self.image_size)
+        video_tensor = F.interpolate(video_tensor, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+        
+        # Permute to (C, T, H, W) shape
+        video = video_tensor.permute(1, 0, 2, 3)
+        
+        # Pad with black frames if there are fewer than self.frames frames
+        if video.shape[1] < self.frames:
+            padding = torch.zeros(3, self.frames - video.shape[1], self.image_size, self.image_size)
+            video = torch.cat([video, padding], dim=1)
+            
+        # Return video and a dummy/zero text embedding of size cond_dim
+        text_embed = torch.zeros(self.cond_dim)
         return video, text_embed
+
+
 
 
 use_vae = True
@@ -45,7 +75,7 @@ else:
 is_cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if is_cuda_available else 'cpu')
 
-dataset = DummyVideoDataset(image_size=IMG_SIZE)
+dataset = MovingMNISTDataset(image_size=IMG_SIZE)
 
 if use_vae:
     config = AutoencoderKLCosmos.load_config("nvidia/Cosmos3-Nano", subfolder="vae")

@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.14.0",
     "bitsandbytes>=0.43.0",
+    "datasets>=5.0.0",
     "diffusers>=0.38.0",
     "einops>=0.8.2",
     "tiktoken>=0.13.0",
