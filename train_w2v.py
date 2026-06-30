@@ -77,15 +77,18 @@ device = torch.device('cuda' if is_cuda_available else 'cpu')
 
 dataset = MovingMNISTDataset(image_size=IMG_SIZE)
 
-if use_vae:
-    config = AutoencoderKLCosmos.load_config("nvidia/Cosmos3-Nano", subfolder="vae")
-    config["in_channels"] = 3
-    config["out_channels"] = 3
-    vae = AutoencoderKLCosmos.from_config(config).to(device, dtype=torch.float32)
-    for param in vae.parameters():
-        param.requires_grad = False
-else:
-    vae = None
+
+vae = AutoencoderKLCosmos.from_pretrained(
+    "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
+    subfolder="vae",
+    torch_dtype=torch.float32,
+).to(device)
+vae.eval()
+for p in vae.parameters():
+    p.requires_grad = False
+
+
+vae_scale_factor = vae.config.scaling_factor   # ~1.0
 
 model = LapFlowDiT(
     **kwargs,
@@ -105,9 +108,27 @@ lap_flow = LapFlow(
     unnormalize_data_fn=lambda t: (t + 1) * 0.5,
     cfg_scale=3.0,
     vae=vae,
-    vae_scale_factor=0.18215
+    vae_scale_factor=vae_scale_factor
 ).to(device)
 
+
+from PIL import Image
+import torchvision.utils as tv_utils
+
+def save_video(tensor, path):
+    # tensor shape: (B, C, T, H, W)
+    # Convert each frame t to a grid of shape (C, H_grid, W_grid)
+    frames = []
+    for t in range(tensor.shape[2]):
+        frame_t = tensor[:, :, t, :, :] # shape: (B, C, H, W)
+        grid_t = tv_utils.make_grid(frame_t, nrow=4)
+        ndarr = grid_t.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+        im = Image.fromarray(ndarr)
+        frames.append(im)
+    
+    gif_path = str(path).replace('.png', '.gif')
+    frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    print(f"Saved sample video to {gif_path}")
 
 if __name__ == '__main__':
 
@@ -116,13 +137,15 @@ if __name__ == '__main__':
         dataset=dataset,
         batch_size=8,
         learning_rate=1e-4,
-        num_train_steps=100000,
+        num_train_steps=10000000,
         save_results_every=1000,
-        checkpoint_every=5000,
+        checkpoint_every=500000000000,
         grad_accum_every = 4,
         use_ema=True,
-        ema_kwargs={'beta': 0.9999}
+        ema_kwargs={'beta': 0.9999},
+        save_sample_fn=save_video
     )
 
     trainer()
+
 
