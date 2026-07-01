@@ -7,3 +7,7 @@ Experimental text-to-video using Cosmos VAE + LapFlow multiscale joint attention
 ```bash
 python train_w2v.py
 ```
+
+### Results
+
+![Latest Result](results/results.123000.gif)
