@@ -1,4 +1,4 @@
-# World to Video
+# Text to Video
 
 Experimental text-to-video using Cosmos VAE + LapFlow multiscale joint attention. Pose embedding via axial pose embedding with temporal awareness.
 
@@ -8,6 +8,8 @@ Experimental text-to-video using Cosmos VAE + LapFlow multiscale joint attention
 python train_w2v.py
 ```
 
-### Results
+### Results at 123000 iteration
 
-![Latest Result](results/results.123000.gif)
+Trained using Moving MNIST:
+
+![Results at 123000 iteration](results/results.123000.gif)
