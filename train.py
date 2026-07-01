@@ -34,19 +34,15 @@ class MovingMNISTDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        # video is a list of frames, each frame is a 2D list of shape (128, 128)
+
         video_val = item["video"][:self.frames]
         
-        # Convert list of lists of lists to a PyTorch tensor (T, H, W) in [0., 1.] range
         video_tensor = torch.tensor(video_val, dtype=torch.float32) / 255.0
         
-        # Add channel dimension to get (T, 1, H, W) and repeat to get 3 channels: (T, 3, H, W)
         video_tensor = video_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
         
-        # Resize to (self.image_size, self.image_size)
         video_tensor = F.interpolate(video_tensor, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
-        
-        # Permute to (C, T, H, W) shape
+    
         video = video_tensor.permute(1, 0, 2, 3)
         
         # Pad with black frames if there are fewer than self.frames frames
@@ -142,8 +138,6 @@ from PIL import Image
 import torchvision.utils as tv_utils
 
 def save_video(tensor, path):
-    # tensor shape: (B, C, T, H, W)
-    # Convert each frame t to a grid of shape (C, H_grid, W_grid)
     frames = []
     for t in range(tensor.shape[2]):
         frame_t = tensor[:, :, t, :, :] # shape: (B, C, H, W)
