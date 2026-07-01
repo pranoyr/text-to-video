@@ -14,6 +14,7 @@ ds = load_dataset("Max-Ploter/detection-moving-mnist-easy")
 
 
 import torch.nn.functional as F
+from transformers import CLIPTokenizer, CLIPTextModel
 
 class MovingMNISTDataset(Dataset):
     def __init__(self, image_size, frames=17, cond_dim=512):
@@ -21,6 +22,12 @@ class MovingMNISTDataset(Dataset):
         self.frames = frames
         self.cond_dim = cond_dim
         self.dataset = ds["train"]
+        
+        # Initialize CLIP tokenizer and text model for text-to-video conditioning
+        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").eval()
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
 
     def __len__(self):
         return len(self.dataset)
@@ -47,8 +54,27 @@ class MovingMNISTDataset(Dataset):
             padding = torch.zeros(3, self.frames - video.shape[1], self.image_size, self.image_size)
             video = torch.cat([video, padding], dim=1)
             
-        # Return video and a dummy/zero text embedding of size cond_dim
-        text_embed = torch.zeros(self.cond_dim)
+        # Extract unique digits present in this video from dataset labels
+        raw_labels = item.get("labels", [])
+        unique_digits = sorted(list(set([
+            int(d) for frame_labels in raw_labels 
+            if isinstance(frame_labels, (list, tuple)) 
+            for d in frame_labels
+        ] + [
+            int(d) for d in raw_labels 
+            if isinstance(d, (int, float))
+        ])))
+        
+        if len(unique_digits) > 0:
+            prompt_str = f"A video showing handwritten digits {', '.join(map(str, unique_digits))} moving and bouncing."
+        else:
+            prompt_str = "A video showing handwritten digits moving and bouncing."
+            
+        # Encode text prompt into embedding tensor of shape (sequence_length, cond_dim)
+        inputs = self.tokenizer(prompt_str, padding="max_length", max_length=16, truncation=True, return_tensors="pt")
+        with torch.no_grad():
+            text_embed = self.text_encoder(inputs.input_ids)[0].squeeze(0).to(torch.float32)  # Shape: (16, 512)
+            
         return video, text_embed
 
 
@@ -106,7 +132,7 @@ lap_flow = LapFlow(
     model=model,
     normalize_data_fn=lambda t: (t * 2) - 1,
     unnormalize_data_fn=lambda t: (t + 1) * 0.5,
-    cfg_scale=1,
+    cfg_scale=3,
     vae=vae,
     vae_scale_factor=vae_scale_factor
 ).to(device)
