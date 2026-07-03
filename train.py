@@ -2,19 +2,18 @@ import torch
 import torchvision.transforms as T
 from torch.utils.data import Dataset
 from diffusers import AutoencoderKLCosmos
+from lapflow import LapFlow, LapFlowDiT, Trainer
 
-from lapflow import LapFlow, LapFlowDiT
-
-from rectified_flow import Trainer
-
+from PIL import Image
+import torchvision.utils as tv_utils
 
 from datasets import load_dataset
 
-ds = load_dataset("Max-Ploter/detection-moving-mnist-easy")
-
-
 import torch.nn.functional as F
 from transformers import CLIPTokenizer, CLIPTextModel
+
+ds = load_dataset("Max-Ploter/detection-moving-mnist-easy")
+
 
 class MovingMNISTDataset(Dataset):
     def __init__(self, image_size, frames=17, cond_dim=512):
@@ -74,8 +73,6 @@ class MovingMNISTDataset(Dataset):
         return video, text_embed
 
 
-
-
 use_vae = True
 
 if use_vae:
@@ -98,7 +95,6 @@ is_cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if is_cuda_available else 'cpu')
 
 dataset = MovingMNISTDataset(image_size=IMG_SIZE)
-
 
 vae = AutoencoderKLCosmos.from_pretrained(
     "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
@@ -134,8 +130,7 @@ lap_flow = LapFlow(
 ).to(device)
 
 
-from PIL import Image
-import torchvision.utils as tv_utils
+
 
 def save_video(tensor, path):
     frames = []

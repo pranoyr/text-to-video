@@ -1,13 +1,30 @@
+from pathlib import Path
+from shutil import rmtree
 import math
+from typing import Callable
 import torch
+from torch import is_tensor
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import Module
+from torch.optim import Adam
+from torch.utils.data import DataLoader, Dataset
+from torchvision.utils import save_image
+from accelerate import Accelerator
+from ema_pytorch import EMA
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch.amp import autocast
 import einx
 
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def cycle(dl):
+    while True:
+        for batch in dl:
+            yield batch
 
 
 def pair(t):
@@ -556,3 +573,248 @@ class LapFlow(Module):
             total_loss += F.mse_loss(pred, target) * weight
 
         return total_loss
+
+# trainer
+
+class Trainer(Module):
+    def __init__(
+        self,
+        model: dict | LapFlow | Module,
+        *,
+        dataset: Dataset,
+        num_train_steps = 70_000,
+        learning_rate = 3e-4,
+        batch_size = 16,
+        checkpoints_folder: str = './checkpoints',
+        results_folder: str = './results',
+        save_results_every: int = 100,
+        checkpoint_every: int = 1000,
+        sample_temperature: float = 1.,
+        num_samples: int = 16,
+        sample_kwargs: dict = dict(),
+        adam_kwargs: dict = dict(),
+        accelerate_kwargs: dict = dict(),
+        ema_kwargs: dict = dict(),
+        use_ema = True,
+        grad_accum_every = 1,
+        max_grad_norm = 0.5,
+        clear_results_folder = False,
+        save_sample_fn: Callable | None = None
+    ):
+        super().__init__()
+
+        if grad_accum_every > 1:
+            accelerate_kwargs.update(gradient_accumulation_steps = grad_accum_every)
+
+        self.accelerator = Accelerator(**accelerate_kwargs)
+        self.grad_accum_every = grad_accum_every
+
+        if isinstance(model, dict):
+            model = LapFlow(**model)
+
+        self.model = model
+
+        # determine whether to keep track of EMA (if not using consistency FM or self-flow)
+        # which will determine which model to use for sampling
+
+        use_ema &= not getattr(self.model, 'use_consistency', False)
+        use_ema &= not getattr(self.model, 'self_flow', False)
+
+        self.use_ema = use_ema
+        self.ema_model = None
+
+        if self.is_main and use_ema:
+            self.ema_model = EMA(
+                self.model,
+                forward_method_names = ('sample',),
+                **ema_kwargs
+            )
+
+            self.ema_model.to(self.accelerator.device)
+
+        # optimizer, dataloader, and all that
+
+        self.optimizer = Adam(model.parameters(), lr = learning_rate, **adam_kwargs)
+        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True)
+
+        self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
+
+        self.num_train_steps = num_train_steps
+
+        self.return_loss_breakdown = getattr(self.model, 'return_loss_breakdown', False)
+
+        # folders
+
+        self.checkpoints_folder = Path(checkpoints_folder)
+        self.results_folder = Path(results_folder)
+
+        if self.is_main and clear_results_folder and self.results_folder.exists():
+            rmtree(str(self.results_folder))
+
+        self.checkpoints_folder.mkdir(exist_ok = True, parents = True)
+        self.results_folder.mkdir(exist_ok = True, parents = True)
+
+        self.checkpoint_every = checkpoint_every
+        self.save_results_every = save_results_every
+        self.sample_temperature = sample_temperature
+
+        self.num_sample_rows = int(math.sqrt(num_samples))
+        assert (self.num_sample_rows ** 2) == num_samples, f'{num_samples} must be a square'
+        self.num_samples = num_samples
+
+        self.sample_kwargs = sample_kwargs
+
+        assert self.checkpoints_folder.is_dir()
+        assert self.results_folder.is_dir()
+
+        self.max_grad_norm = max_grad_norm
+        self.save_sample_fn = save_sample_fn
+
+    @property
+    def is_main(self):
+        return self.accelerator.is_main_process
+
+    def save(self, path):
+        if not self.is_main:
+            return
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+        ema_state = None
+
+        if exists(self.ema_model):
+            ema_state = self.ema_model.state_dict()
+
+        elif hasattr(unwrapped_model, 'ema_model') and unwrapped_model.ema_model is not None:
+            ema_state = unwrapped_model.ema_model.state_dict()
+
+        save_package = dict(
+            model = unwrapped_model.state_dict(),
+            ema_model = ema_state,
+            optimizer = self.optimizer.state_dict(),
+        )
+
+        torch.save(save_package, str(self.checkpoints_folder / path))
+
+    def load(self, path):
+        if not self.is_main:
+            return
+
+        load_package = torch.load(self.checkpoints_folder / path)
+
+        self.model.load_state_dict(load_package["model"])
+
+        # load ema
+
+        ema_state = load_package["ema_model"]
+
+        if exists(ema_state):
+            if exists(self.ema_model):
+                self.ema_model.load_state_dict(ema_state)
+
+            elif exists(getattr(self.model, 'ema_model', None)):
+                self.model.ema_model.load_state_dict(ema_state)
+
+        self.optimizer.load_state_dict(load_package["optimizer"])
+
+    def log(self, *args, **kwargs):
+        return self.accelerator.log(*args, **kwargs)
+
+    def log_images(self, *args, **kwargs):
+        return self.accelerator.log(*args, **kwargs)
+
+    def sample(self, fname):
+        eval_model = default(self.ema_model, self.model)
+
+        dl = cycle(self.dl)
+        mock_data = next(dl)
+
+        additional_sample_kwargs = self.sample_kwargs.copy()
+
+        # for conditioning
+        if isinstance(mock_data, (tuple, list)):
+            actual_image, label = mock_data[0], mock_data[1]
+            data_shape = actual_image.shape[1:]
+            cond = label[:self.num_samples]
+            if cond.shape[0] <what  self.num_samples:
+                reps = math.ceil(self.num_samples / cond.shape[0])
+                cond = cond.repeat(reps, *([1] * (cond.ndim - 1)))[:self.num_samples]
+            additional_sample_kwargs['cond'] = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
+        else:
+            data_shape = mock_data.shape[1:]
+
+        unwrapped_model = getattr(eval_model, 'model', eval_model)
+        if unwrapped_model.__class__.__name__ == 'RectifiedFlow':
+            additional_sample_kwargs.update(temperature = self.sample_temperature)
+
+        with torch.no_grad():
+            sampled = eval_model.sample(
+                batch_size = self.num_samples,
+                data_shape = data_shape,
+                **additional_sample_kwargs
+            )
+
+        sampled.clamp_(0., 1.)
+
+        if exists(self.save_sample_fn):
+            self.save_sample_fn(sampled, fname)
+        else:
+            sampled = rearrange(sampled, '(row col) c h w -> c (row h) (col w)', row = self.num_sample_rows)
+            save_image(sampled, str(fname))
+        return sampled
+
+    def forward(self):
+
+        dl = cycle(self.dl)
+
+        for ind in range(self.num_train_steps):
+            step = ind + 1
+
+            self.model.train()
+
+            with self.accelerator.accumulate(self.model):
+                data = next(dl)
+
+                if self.return_loss_breakdown:
+                    loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
+                    self.log(loss_breakdown._asdict(), step = step)
+
+                    breakdown_str = ' | '.join(f'{k}: {v.item() if is_tensor(v) else v:.3f}' for k, v in loss_breakdown._asdict().items())
+                    self.accelerator.print(f'[{step}] {breakdown_str}')
+                else:
+                    loss = self.model(data)
+                    self.accelerator.print(f'[{step}] loss: {loss.item():.3f}')
+
+                self.accelerator.backward(loss)
+
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+            if hasattr(unwrapped_model, 'post_training_step_update'):
+                unwrapped_model.post_training_step_update()
+
+            if self.is_main and self.use_ema:
+                self.ema_model.ema_model.data_shape = unwrapped_model.data_shape
+                self.ema_model.update()
+
+            self.accelerator.wait_for_everyone()
+
+            if self.is_main:
+
+                if divisible_by(step, self.save_results_every):
+
+                    sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
+
+                    self.log_images(sampled, step = step)
+
+                if divisible_by(step, self.checkpoint_every):
+                    self.save(f'checkpoint.{step}.pt')
+
+            self.accelerator.wait_for_everyone()
+
+        print('training complete')
