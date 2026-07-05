@@ -10,7 +10,7 @@ from torch.nn import Module
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import save_image
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from ema_pytorch import EMA
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -606,7 +606,14 @@ class Trainer(Module):
         if grad_accum_every > 1:
             accelerate_kwargs.update(gradient_accumulation_steps = grad_accum_every)
 
-        self.accelerator = Accelerator(**accelerate_kwargs)
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=True
+        )
+
+        self.accelerator = Accelerator(
+            kwargs_handlers=[ddp_kwargs],
+            **accelerate_kwargs
+        )
         self.grad_accum_every = grad_accum_every
 
         if isinstance(model, dict):
