@@ -111,11 +111,11 @@ vae_scale_factor = vae.config.scaling_factor   # ~1.0
 model = LapFlowDiT(
     **kwargs,
     patch_size=2,
-    dim=256,
-    depth=6,
-    heads=8,
-    mlp_dim=1024,
-    accept_cond=True,
+    dim=640,
+    depth=16,
+    heads=10,
+    dim_head=64,
+    mlp_dim=2560,
     cond_as_labels=False, # Now accepting text embeddings
     dim_cond=512          # Text embedding dimension
 )

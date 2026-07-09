@@ -265,16 +265,6 @@ class DiTBlock(Module):
 
         return outs, context
 
-class LabelEmbedder(nn.Module):
-    def __init__(self, num_classes, hidden_size):
-        super().__init__()
-        self.num_classes = num_classes
-        self.embedding_table = nn.Embedding(num_classes + 1, hidden_size)
-
-    def forward(self, labels):
-        labels = labels.long()
-        labels = torch.where(labels < 0, self.num_classes, labels)
-        return self.embedding_table(labels)
 
 class LapFlowDiT(Module):
     def __init__(
@@ -289,7 +279,6 @@ class LapFlowDiT(Module):
         dim_head = 64,
         num_scales = 3,
         dropout = 0.,
-        accept_cond = False,
         dim_cond = None,
         cond_as_labels = False,
         num_classes = None,
@@ -334,6 +323,8 @@ class LapFlowDiT(Module):
 
         context_dim = dim_cond if dim_cond is not None else dim
 
+        self.null_cond_emb = nn.Parameter(torch.randn(1, 1, context_dim) * 0.02)
+
         self.blocks = nn.ModuleList([
             DiTBlock(
                 dim=dim,
@@ -346,6 +337,9 @@ class LapFlowDiT(Module):
             )
             for _ in range(depth)
         ])
+
+    def get_null_cond(self, cond):
+        return repeat(self.null_cond_emb, '1 1 d -> b l d', b=cond.shape[0], l=cond.shape[1]).to(cond.dtype)
 
     def forward(self, imgs_list, times, cond=None):
         xs = []
@@ -426,6 +420,9 @@ class LapFlow(Module):
         weights = default(loss_weights, [1.0] * self.num_scales)
         self.register_buffer('loss_weights', torch.tensor(weights, dtype=torch.float32))
 
+    def get_null_cond(self, cond):
+        return self.model.get_null_cond(cond)
+
 
     def get_laplacian_pyramid(self, x):
 
@@ -488,7 +485,7 @@ class LapFlow(Module):
                     cond = kwargs['cond']
                     preds_cond = self.model(model_inputs, **time_kwarg, **kwargs)
 
-                    kwargs['cond'] = torch.full_like(cond, -1)
+                    kwargs['cond'] = self.get_null_cond(cond)
                     preds_uncond = self.model(model_inputs, **time_kwarg, **kwargs)
                     kwargs['cond'] = cond
 
@@ -521,7 +518,7 @@ class LapFlow(Module):
             cond = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
 
             if self.training and torch.rand(1).item() < 0.1:
-                cond = torch.full_like(cond, -1)
+                cond = self.get_null_cond(cond)
 
             kwargs['cond'] = cond
             data = actual_image
