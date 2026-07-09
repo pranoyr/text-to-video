@@ -730,17 +730,19 @@ class Trainer(Module):
     def log_images(self, *args, **kwargs):
         return self.accelerator.log(*args, **kwargs)
 
-    def sample(self, fname):
-        eval_model = default(self.ema_model, self.model)
+    def sample(self, fname, data = None):
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        eval_model = default(self.ema_model, unwrapped_model)
 
-        dl = cycle(self.dl)
-        mock_data = next(dl)
+        if not exists(data):
+            dl = cycle(self.dl)
+            data = next(dl)
 
         additional_sample_kwargs = self.sample_kwargs.copy()
 
         # for conditioning
-        if isinstance(mock_data, (tuple, list)):
-            actual_image, label = mock_data[0], mock_data[1]
+        if isinstance(data, (tuple, list)):
+            actual_image, label = data[0], data[1]
             data_shape = actual_image.shape[1:]
             cond = label[:self.num_samples]
             if cond.shape[0] <self.num_samples:
@@ -748,10 +750,10 @@ class Trainer(Module):
                 cond = cond.repeat(reps, *([1] * (cond.ndim - 1)))[:self.num_samples]
             additional_sample_kwargs['cond'] = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
         else:
-            data_shape = mock_data.shape[1:]
+            data_shape = data.shape[1:]
 
-        unwrapped_model = getattr(eval_model, 'model', eval_model)
-        if unwrapped_model.__class__.__name__ == 'RectifiedFlow':
+        unwrapped_eval_model = getattr(eval_model, 'model', eval_model)
+        if unwrapped_eval_model.__class__.__name__ == 'RectifiedFlow':
             additional_sample_kwargs.update(temperature = self.sample_temperature)
 
         with torch.no_grad():
@@ -815,7 +817,7 @@ class Trainer(Module):
 
                 if divisible_by(step, self.save_results_every):
 
-                    sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
+                    sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'), data = data)
 
                     self.log_images(sampled, step = step)
 
