@@ -1,3 +1,4 @@
+import os
 import torch
 import torchvision.transforms as T
 from torch.utils.data import Dataset
@@ -66,11 +67,164 @@ class MovingMNISTDataset(Dataset):
             prompt_str = "A video showing handwritten digits moving and bouncing."
             
         # Encode text prompt into embedding tensor of shape (sequence_length, cond_dim)
-        inputs = self.tokenizer(prompt_str, padding="max_length", max_length=16, truncation=True, return_tensors="pt")
+        inputs = self.tokenizer(prompt_str, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
         with torch.no_grad():
             text_embed = self.text_encoder(inputs.input_ids)[0].squeeze(0).to(torch.float32)  # Shape: (16, 512)
             
         return video, text_embed
+
+
+class OpenVidDataset(Dataset):
+    """
+    Dataset loader for OpenVid-1M (nkp37/OpenVid-1M) or OpenVidHD.
+    Supports loading via Hugging Face `load_dataset` or local CSV + video folder.
+    """
+    def __init__(
+        self,
+        image_size=256,
+        frames=17,
+        cond_dim=512,
+        max_length=77,
+        split="train",
+        video_folder=None,
+        csv_path=None,
+        streaming=False,
+    ):
+        self.image_size = image_size
+        self.frames = frames
+        self.cond_dim = cond_dim
+        self.max_length = max_length
+        self.video_folder = video_folder
+
+        if csv_path is not None:
+            import pandas as pd
+            self.df = pd.read_csv(csv_path)
+            self.dataset = self.df.to_dict("records")
+        else:
+            self.dataset = load_dataset("nkp37/OpenVid-1M", split=split, streaming=streaming)
+
+        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").eval()
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+
+    def __len__(self):
+        try:
+            return len(self.dataset)
+        except TypeError:
+            return 1453466
+
+    def _load_video_tensor(self, video_ref):
+        if isinstance(video_ref, torch.Tensor):
+            video_tensor = video_ref.float()
+            if video_tensor.max() > 1.0:
+                video_tensor = video_tensor / 255.0
+            return video_tensor
+
+        video_path = str(video_ref)
+        if self.video_folder is not None:
+            video_path = os.path.join(self.video_folder, video_path)
+
+        try:
+            import torchvision.io as io
+            video_data, _, _ = io.read_video(video_path, pts_unit="sec")
+            return video_data.permute(0, 3, 1, 2).float() / 255.0
+        except Exception:
+            pass
+
+        try:
+            import decord
+            vr = decord.VideoReader(video_path)
+            total_frames = len(vr)
+            indices = torch.linspace(0, max(total_frames - 1, 0), self.frames).long().tolist()
+            frames_arr = vr.get_batch(indices).asnumpy()
+            return torch.from_numpy(frames_arr).permute(0, 3, 1, 2).float() / 255.0
+        except Exception:
+            pass
+
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            frames_list = []
+            while len(frames_list) < self.frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames_list.append(torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0)
+            cap.release()
+            if len(frames_list) > 0:
+                return torch.stack(frames_list, dim=0)
+        except Exception:
+            pass
+
+        try:
+            import subprocess
+            import numpy as np
+            cmd = [
+                "ffmpeg", "-i", video_path,
+                "-vf", f"scale={self.image_size}:{self.image_size}",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-v", "quiet", "-"
+            ]
+            res = subprocess.run(cmd, capture_output=True, check=True)
+            frame_bytes = self.image_size * self.image_size * 3
+            num_frames = len(res.stdout) // frame_bytes
+            if num_frames > 0:
+                arr = np.frombuffer(res.stdout[:num_frames * frame_bytes], dtype=np.uint8).copy()
+                arr = arr.reshape(num_frames, self.image_size, self.image_size, 3)
+                return torch.from_numpy(arr).permute(0, 3, 1, 2).float() / 255.0
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"Unable to read video file {video_path}. Please install decord, opencv-python, or verify system ffmpeg access."
+        )
+
+    def _process_item(self, item):
+        video_ref = item["video"]
+        caption = item.get("caption", "A video.")
+        if not isinstance(caption, str) or len(caption.strip()) == 0:
+            caption = "A video."
+
+        video_tensor = self._load_video_tensor(video_ref)
+
+        T_curr = video_tensor.shape[0]
+        if T_curr > self.frames:
+            indices = torch.linspace(0, T_curr - 1, self.frames).long()
+            video_tensor = video_tensor[indices]
+        elif T_curr < self.frames:
+            pad_count = self.frames - T_curr
+            padding = torch.zeros(pad_count, *video_tensor.shape[1:], dtype=video_tensor.dtype)
+            video_tensor = torch.cat([video_tensor, padding], dim=0)
+
+        video_tensor = F.interpolate(
+            video_tensor,
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        video = video_tensor.permute(1, 0, 2, 3)
+
+        inputs = self.tokenizer(
+            caption,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            text_embed = self.text_encoder(inputs.input_ids)[0].squeeze(0).to(torch.float32)
+
+        return video, text_embed
+
+    def __getitem__(self, idx):
+        return self._process_item(self.dataset[idx])
+
+    def __iter__(self):
+        for item in self.dataset:
+            yield self._process_item(item)
 
 
 use_vae = True
@@ -95,6 +249,8 @@ is_cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if is_cuda_available else 'cpu')
 
 dataset = MovingMNISTDataset(image_size=IMG_SIZE)
+# To use OpenVid-1M dataset instead:
+# dataset = OpenVidDataset(image_size=IMG_SIZE, video_folder="path/to/video_folder")
 
 vae = AutoencoderKLCosmos.from_pretrained(
     "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
