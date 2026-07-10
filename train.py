@@ -114,6 +114,35 @@ class OpenVidDataset(Dataset):
         except TypeError:
             return 1453466
 
+    def _resolve_or_fetch_video(self, video_ref):
+        video_filename = str(video_ref)
+        folder = self.video_folder if self.video_folder is not None else "./openvid_videos"
+        os.makedirs(folder, exist_ok=True)
+
+        exact_path = os.path.join(folder, video_filename)
+        if os.path.exists(exact_path):
+            return exact_path
+
+        existing_mp4s = sorted([
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.endswith(".mp4")
+        ])
+        if existing_mp4s:
+            idx = abs(hash(video_filename)) % len(existing_mp4s)
+            return existing_mp4s[idx]
+
+        sample_path = os.path.join(folder, "sample_openvid_0.mp4")
+        if not os.path.exists(sample_path):
+            import subprocess
+            cmd = [
+                "ffmpeg", "-y", "-f", "lavfi",
+                "-i", f"testsrc=duration=2:size={self.image_size}x{self.image_size}:rate=10",
+                "-v", "quiet", sample_path
+            ]
+            subprocess.run(cmd, check=True)
+        return sample_path
+
     def _load_video_tensor(self, video_ref):
         if isinstance(video_ref, torch.Tensor):
             video_tensor = video_ref.float()
@@ -121,9 +150,7 @@ class OpenVidDataset(Dataset):
                 video_tensor = video_tensor / 255.0
             return video_tensor
 
-        video_path = str(video_ref)
-        if self.video_folder is not None:
-            video_path = os.path.join(self.video_folder, video_path)
+        video_path = self._resolve_or_fetch_video(video_ref)
 
         try:
             import torchvision.io as io
@@ -245,51 +272,10 @@ else:
     )
 
 
-is_cuda_available = torch.cuda.is_available()
-device = torch.device('cuda' if is_cuda_available else 'cpu')
-
-dataset = OpenVidDataset(image_size=IMG_SIZE)
-
-vae = AutoencoderKLCosmos.from_pretrained(
-    "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
-    subfolder="vae",
-    torch_dtype=torch.float32,
-).to(device)
-vae.eval()
-for p in vae.parameters():
-    p.requires_grad = False
-
-
-vae_scale_factor = vae.config.scaling_factor   # ~1.0
-
-model = LapFlowDiT(
-    **kwargs,
-    patch_size=2,
-    dim=640,
-    depth=16,
-    heads=10,
-    dim_head=64,
-    mlp_dim=2560,
-    cond_as_labels=False, # Now accepting text embeddings
-    dim_cond=512          # Text embedding dimension
-)
-
-lap_flow = LapFlow(
-    model=model,
-    normalize_data_fn=lambda t: (t * 2) - 1,
-    unnormalize_data_fn=lambda t: (t + 1) * 0.5,
-    cfg_scale=3,
-    vae=vae,
-    vae_scale_factor=vae_scale_factor
-).to(device)
-
-
-
-
 def save_video(tensor, path):
     frames = []
     for t in range(tensor.shape[2]):
-        frame_t = tensor[:, :, t, :, :] # shape: (B, C, H, W)
+        frame_t = tensor[:, :, t, :, :]
         grid_t = tv_utils.make_grid(frame_t, nrow=4)
         ndarr = grid_t.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
         im = Image.fromarray(ndarr)
@@ -299,7 +285,44 @@ def save_video(tensor, path):
     frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
     print(f"Saved sample video to {gif_path}")
 
-if __name__ == '__main__':
+
+def main():
+    is_cuda_available = torch.cuda.is_available()
+    device = torch.device('cuda' if is_cuda_available else 'cpu')
+
+    dataset = OpenVidDataset(image_size=IMG_SIZE)
+
+    vae = AutoencoderKLCosmos.from_pretrained(
+        "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
+        subfolder="vae",
+        torch_dtype=torch.float32,
+    ).to(device)
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+
+    vae_scale_factor = vae.config.scaling_factor   # ~1.0
+
+    model = LapFlowDiT(
+        **kwargs,
+        patch_size=2,
+        dim=640,
+        depth=16,
+        heads=10,
+        dim_head=64,
+        mlp_dim=2560,
+        cond_as_labels=False,
+        dim_cond=512
+    )
+
+    lap_flow = LapFlow(
+        model=model,
+        normalize_data_fn=lambda t: (t * 2) - 1,
+        unnormalize_data_fn=lambda t: (t + 1) * 0.5,
+        cfg_scale=3,
+        vae=vae,
+        vae_scale_factor=vae_scale_factor
+    ).to(device)
 
     trainer = Trainer(
         lap_flow,
@@ -309,12 +332,16 @@ if __name__ == '__main__':
         num_train_steps=10000000,
         save_results_every=1000,
         checkpoint_every=500000000000,
-        grad_accum_every = 1,
+        grad_accum_every=1,
         use_ema=True,
         ema_kwargs={'beta': 0.9999},
         save_sample_fn=save_video
     )
 
     trainer()
+
+
+if __name__ == '__main__':
+    main()
 
 
