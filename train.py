@@ -248,9 +248,7 @@ else:
 is_cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if is_cuda_available else 'cpu')
 
-dataset = MovingMNISTDataset(image_size=IMG_SIZE)
-# To use OpenVid-1M dataset instead:
-# dataset = OpenVidDataset(image_size=IMG_SIZE, video_folder="path/to/video_folder")
+dataset = OpenVidDataset(image_size=IMG_SIZE)
 
 vae = AutoencoderKLCosmos.from_pretrained(
     "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
