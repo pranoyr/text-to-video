@@ -405,7 +405,12 @@ class LapFlow(Module):
         self.unnormalize_data_fn = unnormalize_data_fn
         self.cfg_scale = cfg_scale
         self.vae = vae
-        self.vae_scale_factor = vae_scale_factor
+        if exists(self.vae):
+            self.register_buffer('latents_mean', torch.tensor(self.vae.config.latents_mean, dtype=torch.float32).view(1, -1, 1, 1, 1))
+            self.register_buffer('latents_std', torch.tensor(self.vae.config.latents_std, dtype=torch.float32).view(1, -1, 1, 1, 1))
+        else:
+            self.latents_mean = None
+            self.latents_std = None
 
         assert self.num_scales in [2, 3]
 
@@ -504,7 +509,11 @@ class LapFlow(Module):
             curr = up(curr) + pyd_states[i]
 
         if exists(self.vae):
-            curr = curr / self.vae_scale_factor
+            # Reverse Cosmos Channel-wise Normalization
+            lat_std = self.latents_std.squeeze(2) if curr.ndim == 4 else self.latents_std
+            lat_mean = self.latents_mean.squeeze(2) if curr.ndim == 4 else self.latents_mean
+            curr = (curr * lat_std) + lat_mean
+
             decoded = self.vae.decode(curr)
             curr = decoded.sample
 
@@ -531,7 +540,11 @@ class LapFlow(Module):
                 self.vae.eval()
                 encoded = self.vae.encode(data)
                 data = encoded.latent_dist.sample()
-                data = data * self.vae_scale_factor
+
+                # Cosmos Channel-wise Normalization
+                lat_mean = self.latents_mean.squeeze(2) if data.ndim == 4 else self.latents_mean
+                lat_std = self.latents_std.squeeze(2) if data.ndim == 4 else self.latents_std
+                data = (data - lat_mean) / lat_std
 
         shape, ndim = data.shape, data.ndim
 
@@ -638,8 +651,9 @@ class Trainer(Module):
 
         # optimizer, dataloader, and all that
 
+        collate_fn = getattr(dataset, 'collate_fn', None)
         self.optimizer = Adam(model.parameters(), lr = learning_rate, **adam_kwargs)
-        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True)
+        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True, collate_fn = collate_fn)
 
         self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
 
@@ -819,7 +833,7 @@ class Trainer(Module):
                     self.log_images(sampled, step = step)
 
                 if divisible_by(step, self.checkpoint_every):
-                    self.save(f'checkpoint.{step}.pt')
+                    self.save('checkpoint.pt')
 
             self.accelerator.wait_for_everyone()
 
