@@ -406,8 +406,10 @@ class LapFlow(Module):
         self.cfg_scale = cfg_scale
         self.vae = vae
         if exists(self.vae):
-            self.register_buffer('latents_mean', torch.tensor(self.vae.config.latents_mean, dtype=torch.float32).view(1, -1, 1, 1, 1))
-            self.register_buffer('latents_std', torch.tensor(self.vae.config.latents_std, dtype=torch.float32).view(1, -1, 1, 1, 1))
+            mean_t = rearrange(torch.tensor(self.vae.config.latents_mean, dtype=torch.float32), '... -> (...)')[:16]
+            std_t = rearrange(torch.tensor(self.vae.config.latents_std, dtype=torch.float32), '... -> (...)')[:16]
+            self.register_buffer('latents_mean', rearrange(mean_t, 'c -> 1 c 1 1 1'))
+            self.register_buffer('latents_std', rearrange(std_t, 'c -> 1 c 1 1 1'))
         else:
             self.latents_mean = None
             self.latents_std = None
@@ -510,8 +512,8 @@ class LapFlow(Module):
 
         if exists(self.vae):
             # Reverse Cosmos Channel-wise Normalization
-            lat_std = self.latents_std.squeeze(2) if curr.ndim == 4 else self.latents_std
-            lat_mean = self.latents_mean.squeeze(2) if curr.ndim == 4 else self.latents_mean
+            lat_mean = rearrange(self.latents_mean, '1 c 1 1 1 -> 1 c 1 1') if curr.ndim == 4 else self.latents_mean
+            lat_std = rearrange(self.latents_std, '1 c 1 1 1 -> 1 c 1 1') if curr.ndim == 4 else self.latents_std
             curr = (curr * lat_std) + lat_mean
 
             decoded = self.vae.decode(curr)
@@ -542,8 +544,8 @@ class LapFlow(Module):
                 data = encoded.latent_dist.sample()
 
                 # Cosmos Channel-wise Normalization
-                lat_mean = self.latents_mean.squeeze(2) if data.ndim == 4 else self.latents_mean
-                lat_std = self.latents_std.squeeze(2) if data.ndim == 4 else self.latents_std
+                lat_mean = rearrange(self.latents_mean, '1 c 1 1 1 -> 1 c 1 1') if data.ndim == 4 else self.latents_mean
+                lat_std = rearrange(self.latents_std, '1 c 1 1 1 -> 1 c 1 1') if data.ndim == 4 else self.latents_std
                 data = (data - lat_mean) / lat_std
 
         shape, ndim = data.shape, data.ndim
