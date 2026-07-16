@@ -16,6 +16,8 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch.amp import autocast
 import einx
+from transformers import CLIPTokenizer, CLIPTextModel
+        
 
 
 def divisible_by(num, den):
@@ -597,6 +599,7 @@ class Trainer(Module):
         num_train_steps = 70_000,
         learning_rate = 3e-4,
         batch_size = 16,
+        num_workers = 8,
         checkpoints_folder: str = './checkpoints',
         results_folder: str = './results',
         save_results_every: int = 100,
@@ -628,6 +631,13 @@ class Trainer(Module):
         )
         self.grad_accum_every = grad_accum_every
 
+
+        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").eval().to(self.accelerator.device)
+        
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+
         if isinstance(model, dict):
             model = LapFlow(**model)
 
@@ -655,7 +665,15 @@ class Trainer(Module):
 
         collate_fn = getattr(dataset, 'collate_fn', None)
         self.optimizer = Adam(model.parameters(), lr = learning_rate, **adam_kwargs)
-        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True, collate_fn = collate_fn)
+        self.dl = DataLoader(
+            dataset, 
+            batch_size = batch_size, 
+            shuffle = True, 
+            drop_last = True, 
+            collate_fn = collate_fn,
+            num_workers = num_workers, 
+            pin_memory = True 
+        )
 
         self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
 
@@ -755,10 +773,23 @@ class Trainer(Module):
 
         # for conditioning
         if isinstance(data, (tuple, list)):
-            actual_image, label = data[0], data[1]
+            actual_image, captions = data[0], data[1]
             data_shape = actual_image.shape[1:]
-            cond = label[:self.num_samples]
-            if cond.shape[0] <self.num_samples:
+            
+            # Encode the strings into tensors for sampling
+            inputs = self.tokenizer(
+                captions,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.accelerator.device)
+            
+            with torch.no_grad():
+                cond = self.text_encoder(inputs.input_ids)[0]
+            
+            cond = cond[:self.num_samples]
+            if cond.shape[0] < self.num_samples:
                 reps = math.ceil(self.num_samples / cond.shape[0])
                 cond = cond.repeat(reps, *([1] * (cond.ndim - 1)))[:self.num_samples]
             additional_sample_kwargs['cond'] = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
@@ -795,16 +826,33 @@ class Trainer(Module):
             self.model.train()
 
             with self.accelerator.accumulate(self.model):
-                data = next(dl)
+               
+
+                raw_data = next(dl)
+                videos, captions = raw_data
+
+                # run on CLIP
+                inputs = self.tokenizer(
+                    captions,
+                    padding="max_length",
+                    max_length=77,
+                    truncation=True,
+                    return_tensors="pt",
+                ).to(self.accelerator.device)
+
+                with torch.no_grad():
+                    text_embeds = self.text_encoder(inputs.input_ids)[0]
+
+                train_data = (videos, text_embeds)
 
                 if self.return_loss_breakdown:
-                    loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
+                    loss, loss_breakdown = self.model(train_data, return_loss_breakdown = True)
                     self.log(loss_breakdown._asdict(), step = step)
 
                     breakdown_str = ' | '.join(f'{k}: {v.item() if is_tensor(v) else v:.3f}' for k, v in loss_breakdown._asdict().items())
                     self.accelerator.print(f'[{step}] {breakdown_str}')
                 else:
-                    loss = self.model(data)
+                    loss = self.model(train_data)
                     self.accelerator.print(f'[{step}] loss: {loss.item():.3f}')
 
                 self.accelerator.backward(loss)
@@ -829,8 +877,8 @@ class Trainer(Module):
             if self.is_main:
 
                 if divisible_by(step, self.save_results_every):
-
-                    sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'), data = data)
+         
+                    sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'), data = raw_data)
 
                     self.log_images(sampled, step = step)
 

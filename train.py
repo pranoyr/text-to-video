@@ -110,7 +110,7 @@ if __name__ == '__main__':
         learning_rate=1e-4,
         num_train_steps=10000000,
         save_results_every=1000,
-        checkpoint_every=500000000000,
+        checkpoint_every=50000,
         grad_accum_every = 1,
         use_ema=True,
         ema_kwargs={'beta': 0.9999},
