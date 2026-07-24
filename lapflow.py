@@ -7,7 +7,8 @@ from torch import is_tensor
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import Module
-from torch.optim import Adam
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import save_image
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -643,6 +644,8 @@ class Trainer(Module):
 
         self.model = model
 
+        self.model = model.to(self.accelerator.device)
+
         # determine whether to keep track of EMA (if not using consistency FM or self-flow)
         # which will determine which model to use for sampling
 
@@ -664,7 +667,8 @@ class Trainer(Module):
         # optimizer, dataloader, and all that
 
         collate_fn = getattr(dataset, 'collate_fn', None)
-        self.optimizer = Adam(model.parameters(), lr = learning_rate, **adam_kwargs)
+        self.optimizer = AdamW(model.parameters(), lr = learning_rate, **adam_kwargs)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_train_steps, eta_min=1e-6)
         self.dl = DataLoader(
             dataset, 
             batch_size = batch_size, 
@@ -675,7 +679,7 @@ class Trainer(Module):
             pin_memory = True 
         )
 
-        self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
+        self.model, self.optimizer, self.dl, self.scheduler = self.accelerator.prepare(self.model, self.optimizer, self.dl, self.scheduler)
 
         self.num_train_steps = num_train_steps
 
@@ -707,6 +711,7 @@ class Trainer(Module):
 
         self.max_grad_norm = max_grad_norm
         self.save_sample_fn = save_sample_fn
+        self.step = 0
 
     @property
     def is_main(self):
@@ -727,33 +732,36 @@ class Trainer(Module):
             ema_state = unwrapped_model.ema_model.state_dict()
 
         save_package = dict(
+            step = self.step,
             model = unwrapped_model.state_dict(),
             ema_model = ema_state,
             optimizer = self.optimizer.state_dict(),
+            scheduler = self.scheduler.state_dict(),
         )
 
         torch.save(save_package, str(self.checkpoints_folder / path))
 
     def load(self, path):
-        if not self.is_main:
-            return
+        # Allow all processes to load the checkpoint for DDP and map the tensors to the correct device
+        load_package = torch.load(self.checkpoints_folder / path, map_location=self.accelerator.device)
 
-        load_package = torch.load(self.checkpoints_folder / path)
-
-        self.model.load_state_dict(load_package["model"])
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_model.load_state_dict(load_package["model"])
 
         # load ema
-
-        ema_state = load_package["ema_model"]
+        ema_state = load_package.get("ema_model")
 
         if exists(ema_state):
             if exists(self.ema_model):
                 self.ema_model.load_state_dict(ema_state)
-
-            elif exists(getattr(self.model, 'ema_model', None)):
-                self.model.ema_model.load_state_dict(ema_state)
+            elif hasattr(unwrapped_model, 'ema_model') and unwrapped_model.ema_model is not None:
+                unwrapped_model.ema_model.load_state_dict(ema_state)
 
         self.optimizer.load_state_dict(load_package["optimizer"])
+        if "scheduler" in load_package:
+            self.scheduler.load_state_dict(load_package["scheduler"])
+            
+        self.step = load_package.get("step", 0)
 
     def log(self, *args, **kwargs):
         return self.accelerator.log(*args, **kwargs)
@@ -820,8 +828,9 @@ class Trainer(Module):
 
         dl = cycle(self.dl)
 
-        for ind in range(self.num_train_steps):
-            step = ind + 1
+        for ind in range(self.step, self.num_train_steps):
+            self.step = ind + 1
+            step = self.step
 
             self.model.train()
 
@@ -861,7 +870,19 @@ class Trainer(Module):
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.optimizer.step()
+                self.scheduler.step()
                 self.optimizer.zero_grad()
+
+                if self.is_main:
+                    try:
+                        import wandb
+                        if wandb.run is not None:
+                            wandb.log({
+                                "train/loss": loss.item(),
+                                "train/learning_rate": self.scheduler.get_last_lr()[0],
+                            }, step=step)
+                    except ImportError:
+                        pass
 
             unwrapped_model = self.accelerator.unwrap_model(self.model)
 

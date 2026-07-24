@@ -1,16 +1,14 @@
 import os
 from pathlib import Path
 
-
 import torch
-import torchvision.transforms as T
 import torchvision.utils as tv_utils
 from PIL import Image
 from diffusers import AutoencoderKLCosmos
 from einops import rearrange
 
 from lapflow import LapFlow, LapFlowDiT, Trainer
-from dataloader import MSRVTTDataset
+from dataloader import MSRVTTDataset, worker_init_fn
 
 use_vae = True
 
@@ -44,7 +42,8 @@ vae = AutoencoderKLCosmos.from_pretrained(
     "nvidia/Cosmos-1.0-Tokenizer-CV8x8x8",
     subfolder="vae",
     torch_dtype=torch.float32,
-).to(device)
+)
+
 vae.eval()
 
 for p in vae.parameters():
@@ -64,7 +63,7 @@ model = LapFlowDiT(
 
 lap_flow = LapFlow(
     model=model,
-    normalize_data_fn=lambda t: (t * 2) - 1,
+    normalize_data_fn=lambda t: (t * 2) - 1, # Normalizes dataset's [0,1] -> [-1,1] for VAE
     unnormalize_data_fn=lambda t: (t + 1) * 0.5,
     cfg_scale=3,
     vae=vae
@@ -84,14 +83,23 @@ def save_video(tensor, path):
     gif_path = str(path).replace('.png', '.gif')
     frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
 
+import argparse
+import wandb
+
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train LapFlow DiT")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g. checkpoint.pt)")
+    args = parser.parse_args()
+
+    wandb.init(project="world-2-video-lapflow")
 
     trainer = Trainer(
         lap_flow,
         dataset=dataset,
         batch_size=16,
+        num_workers=8,
         learning_rate=1e-4,
-        num_train_steps=10000000,
+        num_train_steps=2000000,
         save_results_every=1000,
         checkpoint_every=50000,
         grad_accum_every=1,
@@ -99,5 +107,8 @@ if __name__ == '__main__':
         ema_kwargs={'beta': 0.9999},
         save_sample_fn=save_video
     )
+    if args.resume:
+        print(f"Resuming training from checkpoint: {args.resume}")
+        trainer.load(args.resume)
 
     trainer()
