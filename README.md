@@ -8,9 +8,9 @@ Experimental text-to-video using Cosmos VAE + LapFlow multiscale joint attention
 python train.py
 ```
 
-### Results at 123000 iteration
+### Results at 600K iteration
 
-Trained using Moving MNIST:
+Trained using Moving MSR-VTT Dataset:
 
 <img src="results/sample.gif" width="512" alt="Results at 600K iteration" />
 
