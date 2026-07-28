@@ -10,6 +10,9 @@ from einops import rearrange
 from lapflow import LapFlow, LapFlowDiT, Trainer
 from dataloader import MSRVTTDataset, worker_init_fn
 
+import argparse
+import wandb
+
 use_vae = True
 
 if use_vae:
@@ -49,16 +52,15 @@ vae.eval()
 for p in vae.parameters():
     p.requires_grad = False
 
+from config.models import MODEL_CONFIGS
+
+#  "small", "medium", "large", "1B"
+selected_model_size = "small" 
+model_kwargs = MODEL_CONFIGS[selected_model_size]
+
 model = LapFlowDiT(
     **kwargs,
-    patch_size=2,
-    dim=640,
-    depth=16,
-    heads=10,
-    dim_head=64,
-    mlp_dim=2560,
-    cond_as_labels=False,
-    dim_cond=512
+    **model_kwargs
 )
 
 lap_flow = LapFlow(
@@ -83,8 +85,7 @@ def save_video(tensor, path):
     gif_path = str(path).replace('.png', '.gif')
     frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
 
-import argparse
-import wandb
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train LapFlow DiT")

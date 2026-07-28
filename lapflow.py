@@ -17,7 +17,8 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch.amp import autocast
 import einx
-from transformers import CLIPTokenizer, CLIPTextModel
+import wandb
+from transformers import T5Tokenizer, T5EncoderModel
         
 
 
@@ -283,7 +284,6 @@ class LapFlowDiT(Module):
         num_scales = 3,
         dropout = 0.,
         dim_cond = None,
-        cond_as_labels = False,
         num_classes = None,
         sinusoidal_pos_emb_theta = 10000
     ):
@@ -531,8 +531,13 @@ class LapFlow(Module):
             actual_image, cond = data[0], data[1]
             cond = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
 
-            if self.training and torch.rand(1).item() < 0.1:
-                cond = self.get_null_cond(cond)
+            if self.training:
+                batch, device = cond.shape[0], cond.device
+                drop_mask = torch.rand(batch, device=device) < 0.1
+                null_cond = self.get_null_cond(cond)
+                
+                drop_mask = rearrange(drop_mask, f'b -> b 1 1')
+                cond = torch.where(drop_mask, null_cond, cond)
 
             kwargs['cond'] = cond
             data = actual_image
@@ -633,9 +638,8 @@ class Trainer(Module):
         self.grad_accum_every = grad_accum_every
 
 
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").eval().to(self.accelerator.device)
-        
+        self.tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
+        self.text_encoder = T5EncoderModel.from_pretrained("google/t5-v1_1-xxl").eval().to(self.accelerator.device)
         for p in self.text_encoder.parameters():
             p.requires_grad = False
 
@@ -746,16 +750,27 @@ class Trainer(Module):
         load_package = torch.load(self.checkpoints_folder / path, map_location=self.accelerator.device)
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
-        unwrapped_model.load_state_dict(load_package["model"])
+        
+        # Safely load model state dict by filtering out shape mismatches
+        model_state_dict = load_package["model"]
+        current_state = unwrapped_model.state_dict()
+        filtered_state = {k: v for k, v in model_state_dict.items() if k in current_state and v.shape == current_state[k].shape}
+        
+        missing, unexpected = unwrapped_model.load_state_dict(filtered_state, strict=False)
+        if len(missing) > 0:
+            print(f"Skipped loading {len(missing)} parameters due to shape mismatch (e.g. cross-attention).")
 
-        # load ema
+        # load ema safely
         ema_state = load_package.get("ema_model")
-
         if exists(ema_state):
             if exists(self.ema_model):
-                self.ema_model.load_state_dict(ema_state)
+                current_ema_state = self.ema_model.state_dict()
+                filtered_ema = {k: v for k, v in ema_state.items() if k in current_ema_state and v.shape == current_ema_state[k].shape}
+                self.ema_model.load_state_dict(filtered_ema, strict=False)
             elif hasattr(unwrapped_model, 'ema_model') and unwrapped_model.ema_model is not None:
-                unwrapped_model.ema_model.load_state_dict(ema_state)
+                current_ema_state = unwrapped_model.ema_model.state_dict()
+                filtered_ema = {k: v for k, v in ema_state.items() if k in current_ema_state and v.shape == current_ema_state[k].shape}
+                unwrapped_model.ema_model.load_state_dict(filtered_ema, strict=False)
 
         if load_training_state:
             self.optimizer.load_state_dict(load_package["optimizer"])
@@ -791,7 +806,7 @@ class Trainer(Module):
             inputs = self.tokenizer(
                 captions,
                 padding="max_length",
-                max_length=77,
+                max_length=128,
                 truncation=True,
                 return_tensors="pt",
             ).to(self.accelerator.device)
@@ -843,11 +858,11 @@ class Trainer(Module):
                 raw_data = next(dl)
                 videos, captions = raw_data
 
-                # run on CLIP
+                # run on T5
                 inputs = self.tokenizer(
                     captions,
                     padding="max_length",
-                    max_length=77,
+                    max_length=128,
                     truncation=True,
                     return_tensors="pt",
                 ).to(self.accelerator.device)
@@ -877,22 +892,18 @@ class Trainer(Module):
                 self.optimizer.zero_grad()
 
                 if self.is_main:
-                    try:
-                        import wandb
-                        if wandb.run is not None:
-                            wandb.log({
-                                "train/loss": loss.item(),
-                                "train/learning_rate": self.scheduler.get_last_lr()[0],
-                            }, step=step)
-                    except ImportError:
-                        pass
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/learning_rate": self.scheduler.get_last_lr()[0],
+                    }, step=step)
+                   
 
             unwrapped_model = self.accelerator.unwrap_model(self.model)
 
             if hasattr(unwrapped_model, 'post_training_step_update'):
                 unwrapped_model.post_training_step_update()
 
-            if self.is_main and self.use_ema:
+            if self.is_main and self.use_ema and self.accelerator.sync_gradients:
                 self.ema_model.ema_model.data_shape = unwrapped_model.data_shape
                 self.ema_model.update()
 
