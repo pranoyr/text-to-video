@@ -170,7 +170,7 @@ class MultiScaleJointAttention(nn.Module):
         self.to_out_txt = nn.Sequential(nn.Linear(inner_dim, context_dim), nn.Dropout(dropout))
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, xs, context, sincos_list):
+    def forward(self, xs, context, sincos_list, cond_mask=None):
         device = xs[0].device
         text_len = context.shape[1]
         lens = [x.shape[1] for x in xs] 
@@ -216,7 +216,19 @@ class MultiScaleJointAttention(nn.Module):
 
         # global attention
         sim = torch.einsum('b h q d, b h k d -> b h q k', q, k) * self.scale
+        
+        # Apply the multiscale causal mask 
         sim.masked_fill_(joint_mask, -torch.finfo(sim.dtype).max)
+
+        # attention mask for text conditioning
+        if cond_mask is not None:
+            b_sz, text_len = cond_mask.shape
+            vid_len = sim.shape[-1] - text_len
+            vid_mask = torch.ones((b_sz, vid_len), device=sim.device, dtype=torch.bool)
+            text_vid_mask = torch.cat([cond_mask, vid_mask], dim=1)
+            text_vid_mask = rearrange(text_vid_mask, 'b k -> b 1 1 k')
+            # Apply the T5 padding mask (where ~text_vid_mask means MASK OUT)
+            sim = sim.masked_fill(~text_vid_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim=-1)
         attn = self.dropout(attn)
@@ -250,11 +262,11 @@ class DiTBlock(Module):
 
         self.joint_attn = MultiScaleJointAttention(dim, num_scales, context_dim, heads, dim_head, dropout)
 
-    def forward(self, xs, c, context, sincos_list):
+    def forward(self, xs, c, context, sincos_list, cond_mask=None):
         chunks = [adaln(c).chunk(6, dim=-1) for adaln in self.adaln_vid]
         msa_inputs = [modulate(norm(x), ch[0], ch[1]) for x, norm, ch in zip(xs, self.norm1_vid, chunks)]
 
-        attn_outs, context_outs = self.joint_attn(msa_inputs, self.norm1_txt(context), sincos_list)
+        attn_outs, context_outs = self.joint_attn(msa_inputs, self.norm1_txt(context), sincos_list, cond_mask=cond_mask)
 
         context = context + context_outs
         context = context + self.ff_txt(self.norm2_txt(context))
@@ -344,7 +356,7 @@ class LapFlowDiT(Module):
     def get_null_cond(self, cond):
         return repeat(self.null_cond_emb, '1 1 d -> b l d', b=cond.shape[0], l=cond.shape[1]).to(cond.dtype)
 
-    def forward(self, imgs_list, times, cond=None):
+    def forward(self, imgs_list, times, cond=None, cond_mask=None):
         xs = []
         sincos_list = []
         
@@ -370,7 +382,7 @@ class LapFlowDiT(Module):
             context = context.unsqueeze(1)
 
         for block in self.blocks:
-            xs, context = block(xs, c, context, sincos_list)
+            xs, context = block(xs, c, context, sincos_list, cond_mask=cond_mask)
 
         outs = []
         for x, adaln, norm, linear, unpatch in zip(
@@ -491,13 +503,22 @@ class LapFlow(Module):
                 # only pass the active states to the model
                 model_inputs = pyd_states[:active_count]
 
+            
                 if 'cond' in kwargs and self.cfg_scale > 1.0:
                     cond = kwargs['cond']
+                    cond_mask = kwargs.get('cond_mask', None)
+                    
+                    # run cond
                     preds_cond = self.model(model_inputs, **time_kwarg, **kwargs)
 
                     kwargs['cond'] = self.get_null_cond(cond)
+                    kwargs['cond_mask'] = None
+                    # run uncond
                     preds_uncond = self.model(model_inputs, **time_kwarg, **kwargs)
+                    
+                    # fetch the org
                     kwargs['cond'] = cond
+                    kwargs['cond_mask'] = cond_mask
 
                     preds = [
                         pred_uncond + self.cfg_scale * (pred_cond - pred_uncond)
@@ -529,6 +550,7 @@ class LapFlow(Module):
     def forward(self, data, **kwargs):
         if isinstance(data, (tuple, list)):
             actual_image, cond = data[0], data[1]
+            cond_mask = data[2] if len(data) > 2 else None
             cond = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
 
             if self.training:
@@ -539,7 +561,12 @@ class LapFlow(Module):
                 drop_mask = rearrange(drop_mask, f'b -> b 1 1')
                 cond = torch.where(drop_mask, null_cond, cond)
 
+                if cond_mask is not None:
+                    cond_mask = torch.where(drop_mask.squeeze(-1), torch.ones_like(cond_mask), cond_mask)
+
             kwargs['cond'] = cond
+            if cond_mask is not None:
+                kwargs['cond_mask'] = cond_mask
             data = actual_image
 
 
@@ -813,12 +840,16 @@ class Trainer(Module):
             
             with torch.no_grad():
                 cond = self.text_encoder(inputs.input_ids)[0]
+                cond_mask = inputs.attention_mask.bool()
             
             cond = cond[:self.num_samples]
+            cond_mask = cond_mask[:self.num_samples]
             if cond.shape[0] < self.num_samples:
                 reps = math.ceil(self.num_samples / cond.shape[0])
                 cond = cond.repeat(reps, *([1] * (cond.ndim - 1)))[:self.num_samples]
+                cond_mask = cond_mask.repeat(reps, *([1] * (cond_mask.ndim - 1)))[:self.num_samples]
             additional_sample_kwargs['cond'] = rearrange(cond, 'b 1 -> b') if cond.ndim == 2 and cond.shape[1] == 1 else cond
+            additional_sample_kwargs['cond_mask'] = cond_mask
         else:
             data_shape = data.shape[1:]
 
@@ -868,9 +899,10 @@ class Trainer(Module):
                 ).to(self.accelerator.device)
 
                 with torch.no_grad():
-                    text_embeds = self.text_encoder(inputs.input_ids)[0]
+                    cond = self.text_encoder(inputs.input_ids)[0]
+                    cond_mask = inputs.attention_mask.bool()
 
-                train_data = (videos, text_embeds)
+                train_data = (videos, cond, cond_mask)
 
                 if self.return_loss_breakdown:
                     loss, loss_breakdown = self.model(train_data, return_loss_breakdown = True)
