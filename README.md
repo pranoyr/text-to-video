@@ -12,7 +12,12 @@ python train.py
 
 Trained using Moving MSR-VTT Dataset:
 
-<img src="results/sample.gif" width="512" alt="Results at 600K iteration" />
+<table>
+  <tr>
+    <td><img src="results/sample.gif" width="400" alt="Results at 600K iteration (Part 1)" /></td>
+    <td><img src="results/sample1.gif" width="400" alt="Results at 600K iteration (Part 2)" /></td>
+  </tr>
+</table>
 
 ## Citations
 
