@@ -741,7 +741,7 @@ class Trainer(Module):
 
         torch.save(save_package, str(self.checkpoints_folder / path))
 
-    def load(self, path):
+    def load(self, path, load_training_state=True):
         # Allow all processes to load the checkpoint for DDP and map the tensors to the correct device
         load_package = torch.load(self.checkpoints_folder / path, map_location=self.accelerator.device)
 
@@ -757,11 +757,14 @@ class Trainer(Module):
             elif hasattr(unwrapped_model, 'ema_model') and unwrapped_model.ema_model is not None:
                 unwrapped_model.ema_model.load_state_dict(ema_state)
 
-        self.optimizer.load_state_dict(load_package["optimizer"])
-        if "scheduler" in load_package:
-            self.scheduler.load_state_dict(load_package["scheduler"])
-            
-        self.step = load_package.get("step", 0)
+        if load_training_state:
+            self.optimizer.load_state_dict(load_package["optimizer"])
+            if "scheduler" in load_package:
+                self.scheduler.load_state_dict(load_package["scheduler"])
+                
+            self.step = load_package.get("step", 0)
+        else:
+            self.step = 0
 
     def log(self, *args, **kwargs):
         return self.accelerator.log(*args, **kwargs)

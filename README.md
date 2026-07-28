@@ -12,7 +12,7 @@ python train.py
 
 Trained using Moving MNIST:
 
-<img src="results/results.123000.gif" width="200" alt="Results at 123000 iteration" />
+<img src="results/sample.gif" width="512" alt="Results at 600K iteration" />
 
 ## Citations
 

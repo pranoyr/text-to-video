@@ -89,6 +89,7 @@ import wandb
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train LapFlow DiT")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g. checkpoint.pt)")
+    parser.add_argument("--pretrain", type=str, default=None, help="Path to checkpoint to initialize weights from (starts from scratch)")
     args = parser.parse_args()
 
     wandb.init(project="world-2-video-lapflow")
@@ -109,6 +110,9 @@ if __name__ == '__main__':
     )
     if args.resume:
         print(f"Resuming training from checkpoint: {args.resume}")
-        trainer.load(args.resume)
+        trainer.load(args.resume, load_training_state=True)
+    elif args.pretrain:
+        print(f"Pretraining from weights in: {args.pretrain}. Starting from scratch.")
+        trainer.load(args.pretrain, load_training_state=False)
 
     trainer()
