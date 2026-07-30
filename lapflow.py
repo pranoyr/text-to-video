@@ -122,8 +122,11 @@ class SpatioTemporalAxialRotaryEmbedding(nn.Module):
 
     @autocast(device_type='cuda', enabled=False)
     def forward(self, device, dtype, t, n):
-        seq_t = torch.linspace(-1., 1., steps=t, device=device, dtype=dtype).unsqueeze(-1)
-        seq_spatial = torch.linspace(-1., 1., steps=n, device=device, dtype=dtype).unsqueeze(-1)
+        seq_t = (torch.arange(t, device=device, dtype=dtype) + 0.5) / t * 2.0 - 1.0
+        seq_spatial = (torch.arange(n, device=device, dtype=dtype) + 0.5) / n * 2.0 - 1.0
+
+        seq_t = seq_t.unsqueeze(-1)
+        seq_spatial = seq_spatial.unsqueeze(-1)
 
         seq_t = seq_t * self.scales_t.to(dtype) * math.pi
         seq_spatial = seq_spatial * self.scales_spatial.to(dtype) * math.pi
