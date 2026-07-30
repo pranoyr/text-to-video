@@ -151,3 +151,126 @@ class HFImageAsVideoDataset(Dataset):
         caption = item['answer'][0] if 'answer' in item else "a high quality detailed photograph"
         
         return video_tensor, caption
+
+
+class OpenVidDataset(Dataset):
+    """
+    OpenVid Dataset for Text-to-Video Training.
+    Returns:
+        frames_tensor: Tensor of shape [C, T, H, W] scaled to [0.0, 1.0].
+        caption: Raw text caption string.
+    """
+    def __init__(
+        self, 
+        video_dir: str = "/mnt/h200_disk/pranoy/datasets/OpenVid-1M", 
+        metadata_path: str = "/mnt/h200_disk/pranoy/datasets/OpenVid-1M/metadata.csv", 
+        num_frames: int = 16, 
+        frame_stride: int = 4, 
+        image_size: int = 256,
+        max_retries: int = 5
+    ):
+        self.num_frames = num_frames
+        self.frame_stride = frame_stride
+        self.max_retries = max_retries
+        self.video_dir = self._resolve_video_dir(video_dir)
+        
+        if metadata_path.endswith('.csv'):
+            df = pd.read_csv(metadata_path)
+        else:
+            df = pd.read_json(metadata_path)
+
+        # Detect video column name
+        if 'video_path' in df.columns:
+            self.video_col = 'video_path'
+        elif 'video_id' in df.columns:
+            self.video_col = 'video_id'
+        elif 'video' in df.columns:
+            self.video_col = 'video'
+        elif 'name' in df.columns:
+            self.video_col = 'name'
+        else:
+            self.video_col = df.columns[0] # fallback
+
+        # Detect caption column name
+        if 'caption' in df.columns:
+            self.cap_col = 'caption'
+        elif 'text' in df.columns:
+            self.cap_col = 'text'
+        elif 'prompt' in df.columns:
+            self.cap_col = 'prompt'
+        else:
+            self.cap_col = df.columns[1] # fallback
+
+        # Filter out missing video files during initialization
+        valid_rows = []
+        for _, row in df.iterrows():
+            v_id = str(row[self.video_col])
+            v_name = v_id if v_id.endswith('.mp4') else f"{v_id}.mp4"
+            if os.path.isfile(os.path.join(self.video_dir, v_name)):
+                valid_rows.append(row)
+
+        self.metadata = pd.DataFrame(valid_rows).reset_index(drop=True)
+        print(f"Loaded {len(self.metadata)} valid video-caption samples from {self.video_dir}")
+            
+        self.transform = T.Compose([
+            T.Resize(image_size, antialias=True),
+            T.CenterCrop(image_size)
+        ])
+
+    def _resolve_video_dir(self, target_dir: str) -> str:
+        if not os.path.exists(target_dir):
+            return target_dir
+            
+        for root, _, files in os.walk(target_dir):
+            if any(f.endswith('.mp4') for f in files):
+                return root
+        return target_dir
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def _get_random_idx(self) -> int:
+        return torch.randint(0, len(self.metadata), (1,)).item()
+
+    def __getitem__(self, idx: int):
+        current_idx = idx
+        
+        for attempt in range(self.max_retries):
+            try:
+                row = self.metadata.iloc[current_idx]
+                
+                video_id = str(row[self.video_col])
+                video_filename = video_id if video_id.endswith('.mp4') else f"{video_id}.mp4"
+                video_path = os.path.join(self.video_dir, video_filename)
+                caption = str(row[self.cap_col])
+                
+                vr = VideoReader(video_path, ctx=cpu(0))
+                total_frames = len(vr)
+
+                required_span = (self.num_frames - 1) * self.frame_stride + 1
+                
+                if total_frames >= required_span:
+                    max_start = total_frames - required_span
+                    start_idx = torch.randint(0, max_start + 1, (1,)).item()
+                    frame_indices = range(start_idx, start_idx + required_span, self.frame_stride)
+                elif total_frames >= self.num_frames:
+                    dynamic_stride = total_frames // self.num_frames
+                    required_span = (self.num_frames - 1) * dynamic_stride + 1
+                    max_start = total_frames - required_span
+                    start_idx = torch.randint(0, max_start + 1, (1,)).item()
+                    frame_indices = range(start_idx, start_idx + required_span, dynamic_stride)
+                else:
+                    frame_indices = [i % total_frames for i in range(self.num_frames)]
+
+                frames = vr.get_batch(list(frame_indices)).asnumpy()
+                
+                frames_tensor = rearrange(torch.from_numpy(frames).float() / 255.0, 't h w c -> t c h w')
+                frames_tensor = self.transform(frames_tensor)
+                frames_tensor = rearrange(frames_tensor, 't c h w -> c t h w')
+
+                return frames_tensor, caption
+
+            except Exception as e:
+                current_idx = self._get_random_idx()
+
+        raise RuntimeError(f"Failed to load a valid video sample after {self.max_retries} attempts.")
