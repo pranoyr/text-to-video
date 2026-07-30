@@ -107,7 +107,7 @@ class FeedForward(Module):
         return self.net(x)
 
 class SpatioTemporalAxialRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_freq=10, dim_t=None, dim_spatial=None):
+    def __init__(self, dim, theta=10000, dim_t=None, dim_spatial=None):
         super().__init__()
         self.dim = dim
 
@@ -117,19 +117,24 @@ class SpatioTemporalAxialRotaryEmbedding(nn.Module):
             dim_spatial = (dim - dim_t) // 2
             dim_spatial -= (dim_spatial % 2)
 
-        self.register_buffer('scales_t', torch.linspace(1., max_freq / 2, dim_t // 2))
-        self.register_buffer('scales_spatial', torch.linspace(1., max_freq / 2, dim_spatial // 2))
+        # Standard RoPE exponential decay
+        inv_freq_t = 1.0 / (theta ** (torch.arange(0, dim_t, 2).float() / dim_t))
+        inv_freq_spatial = 1.0 / (theta ** (torch.arange(0, dim_spatial, 2).float() / dim_spatial))
+        
+        self.register_buffer('inv_freq_t', inv_freq_t)
+        self.register_buffer('inv_freq_spatial', inv_freq_spatial)
 
     @autocast(device_type='cuda', enabled=False)
-    def forward(self, device, dtype, t, n):
-        seq_t = (torch.arange(t, device=device, dtype=dtype) + 0.5) / t * 2.0 - 1.0
-        seq_spatial = (torch.arange(n, device=device, dtype=dtype) + 0.5) / n * 2.0 - 1.0
+    def forward(self, device, dtype, t, n, max_n):
+        
+        seq_t = torch.arange(t, device=device, dtype=dtype)
+        seq_spatial = (torch.arange(n, device=device, dtype=dtype) + 0.5) * (max_n / n)
 
         seq_t = seq_t.unsqueeze(-1)
         seq_spatial = seq_spatial.unsqueeze(-1)
 
-        seq_t = seq_t * self.scales_t.to(dtype) * math.pi
-        seq_spatial = seq_spatial * self.scales_spatial.to(dtype) * math.pi
+        seq_t = seq_t * self.inv_freq_t.to(dtype)
+        seq_spatial = seq_spatial * self.inv_freq_spatial.to(dtype)
 
         t_sinu = repeat(seq_t, 't d -> t h w d', h=n, w=n)
         h_sinu = repeat(seq_spatial, 'h d -> t h w d', t=t, w=n) 
@@ -306,6 +311,7 @@ class LapFlowDiT(Module):
         self.num_scales = num_scales
         patch_dim = channels * patch_size * patch_size
 
+        self.max_grid_size = base_image_size // patch_size
         grids = [(base_image_size // (2 ** i)) // patch_size for i in reversed(range(num_scales))]
 
         def linear():
@@ -371,7 +377,7 @@ class LapFlowDiT(Module):
             grid_size = int(math.sqrt(n)) 
             
             # Generate Sin/Cos frequencies for this scale
-            sin, cos = pos_embed(x.device, x.dtype, t, grid_size)
+            sin, cos = pos_embed(x.device, x.dtype, t, grid_size, self.max_grid_size)
             sincos_list.append((sin, cos))
             
             x = rearrange(x, 'b t n d -> b (t n) d')
