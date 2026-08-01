@@ -7,8 +7,9 @@ from PIL import Image
 from diffusers import AutoencoderKLCosmos
 from einops import rearrange
 
-from lapflow import LapFlow, LapFlowDiT, Trainer
-from dataloader import MSRVTTDataset, worker_init_fn
+from lapflow_pytorch.lapflow import LapFlow, LapFlowDiT, Trainer
+from lapflow_pytorch.dataloader import MSRVTTDataset, worker_init_fn
+from lapflow_pytorch.xm_wrapper import XMWrapper
 
 import argparse
 import wandb
@@ -91,7 +92,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train LapFlow DiT")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g. checkpoint.pt)")
     parser.add_argument("--pretrain", type=str, default=None, help="Path to checkpoint to initialize weights from (starts from scratch)")
+    parser.add_argument("--candidates", type=int, default=4, help="Number of candidates for explorative modeling")
     args = parser.parse_args()
+
+    if args.candidates > 1:
+        lap_flow = XMWrapper(lap_flow, candidates=args.candidates).to(device)
 
     wandb.init(project="world-2-video-lapflow")
 
@@ -107,7 +112,8 @@ if __name__ == '__main__':
         grad_accum_every=1,
         use_ema=True,
         ema_kwargs={'beta': 0.9999},
-        save_sample_fn=save_video
+        save_sample_fn=save_video,
+        sample_kwargs={'steps': 80}
     )
     if args.resume:
         print(f"Resuming training from checkpoint: {args.resume}")

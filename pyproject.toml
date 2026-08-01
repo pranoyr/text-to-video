@@ -8,11 +8,17 @@ dependencies = [
     "accelerate>=1.14.0",
     "bitsandbytes>=0.43.0",
     "datasets>=5.0.0",
+    "decord>=0.6.0",
     "diffusers>=0.38.0",
     "einops>=0.8.2",
+    "einx>=0.4.3",
+    "ema-pytorch>=0.8.3",
+    "pandas>=3.0.3",
     "tiktoken>=0.13.0",
     "torch>=2.12.0",
+    "torchvision>=0.27.0",
     "transformers>=5.12.1",
+    "wandb>=0.28.1",
 ]
 
 [tool.uv.sources]
