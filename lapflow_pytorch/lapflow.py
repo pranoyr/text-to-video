@@ -556,7 +556,7 @@ class LapFlow(Module):
         return curr.clamp(0., 1.)
 
 
-    def forward(self, data, loss_reduction='mean', **kwargs):
+    def forward(self, data, loss_reduction='mean', candidates=1, **kwargs):
         if isinstance(data, (tuple, list)):
             actual_image, cond = data[0], data[1]
             cond_mask = data[2] if len(data) > 2 else None
@@ -564,7 +564,11 @@ class LapFlow(Module):
 
             if self.training:
                 batch, device = cond.shape[0], cond.device
-                drop_mask = torch.rand(batch, device=device) < 0.1
+                b_actual = batch // candidates
+                
+                drop_mask = torch.rand(b_actual, device=device) < 0.1
+                drop_mask = repeat(drop_mask, 'b -> (b k)', k=candidates)
+                
                 null_cond = self.get_null_cond(cond)
                 
                 drop_mask = rearrange(drop_mask, f'b -> b 1 1')
@@ -596,6 +600,7 @@ class LapFlow(Module):
 
         self.data_shape = default(self.data_shape, shape[1:])
         batch, device = shape[0], data.device
+        b_actual = batch // candidates
 
         data_list = self.get_laplacian_pyramid(data)
         noise_list = self.get_laplacian_pyramid(torch.randn_like(data))
@@ -604,7 +609,8 @@ class LapFlow(Module):
 
         start_time = self.critical_times[active_scale]
 
-        times = torch.lerp(start_time, torch.tensor(1.0, device=device), torch.rand(batch, device=device))
+        times = torch.lerp(start_time, torch.tensor(1.0, device=device), torch.rand(b_actual, device=device))
+        times = repeat(times, 'b -> (b k)', k=candidates)
 
         alphas = torch.clamp((rearrange(times, 'b -> b 1') - self.critical_times) / (1 - self.critical_times), min=0.0)
         sigma = append_dims(1.0 - times, data.ndim - 1)

@@ -80,7 +80,7 @@ class XMWrapper(Module):
 
         total = batch * candidates
         chunk_size = default(max_batch_size, total) if self.has_loss_reduction else 1
-        extra_kwargs = {'loss_reduction': 'none'} if self.has_loss_reduction else dict()
+        extra_kwargs = {'loss_reduction': 'none', 'candidates': candidates} if self.has_loss_reduction else {'candidates': candidates}
 
         # forward passes
 
