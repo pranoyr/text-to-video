@@ -92,7 +92,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train LapFlow DiT")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g. checkpoint.pt)")
     parser.add_argument("--pretrain", type=str, default=None, help="Path to checkpoint to initialize weights from (starts from scratch)")
-    parser.add_argument("--candidates", type=int, default=4, help="Number of candidates for explorative modeling")
+    parser.add_argument("--candidates", type=int, default=1, help="Number of candidates for explorative modeling")
     args = parser.parse_args()
 
     if args.candidates > 1:
